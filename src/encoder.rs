@@ -706,6 +706,102 @@ impl<W: Write> WebPEncoder<W> {
 
         Ok(())
     }
+
+    /// Encode image data with the indicated color type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the image data is not of the indicated dimensions.
+    pub fn encode_animated(
+        mut self,
+        data: &[&[u8]],
+        width: u32,
+        height: u32,
+        color: ColorType,
+        loop_count: u16,
+        background_color: [u8; 4],
+    ) -> Result<(), EncodingError> {
+        let mut frames = Vec::new();
+        for data in data {
+            let mut frame = Vec::new();
+            encode_frame(&mut frame, data, width, height, color)?;
+            frames.push(frame);
+        }
+
+        let mut total_bytes = 36;
+        for frame in &frames {
+            total_bytes += chunk_size(chunk_size(frame.len()) as usize + 16);
+        }
+        if !self.icc_profile.is_empty() {
+            total_bytes += chunk_size(self.icc_profile.len());
+        }
+        if !self.exif_metadata.is_empty() {
+            total_bytes += chunk_size(self.exif_metadata.len());
+        }
+        if !self.xmp_metadata.is_empty() {
+            total_bytes += chunk_size(self.xmp_metadata.len());
+        }
+
+        let mut flags = 0;
+        if !self.xmp_metadata.is_empty() {
+            flags |= 1 << 2;
+        }
+        if !self.exif_metadata.is_empty() {
+            flags |= 1 << 3;
+        }
+        if let ColorType::La8 | ColorType::Rgba8 = color {
+            flags |= 1 << 4;
+        }
+        if !self.icc_profile.is_empty() {
+            flags |= 1 << 5;
+        }
+
+        self.writer.write_all(b"RIFF")?;
+        self.writer.write_all(&total_bytes.to_le_bytes())?;
+        self.writer.write_all(b"WEBP")?;
+
+        let mut vp8x = Vec::new();
+        vp8x.write_all(&[flags])?; // flags
+        vp8x.write_all(&[0; 3])?; // reserved
+        vp8x.write_all(&(width - 1).to_le_bytes()[..3])?; // canvas width
+        vp8x.write_all(&(height - 1).to_le_bytes()[..3])?; // canvas height
+        write_chunk(&mut self.writer, b"VP8X", &vp8x)?;
+
+        if !self.icc_profile.is_empty() {
+            write_chunk(&mut self.writer, b"ICCP", &self.icc_profile)?;
+        }
+
+        let mut anim = Vec::new();
+        anim.push(background_color[2]); // background blue
+        anim.push(background_color[1]); // background green
+        anim.push(background_color[0]); // background red
+        anim.push(background_color[3]); // background alpha
+        anim.write_all(&loop_count.to_le_bytes())?;
+        write_chunk(&mut self.writer, b"ANIM", &anim)?;
+
+        for frame in frames {
+            let mut amnf = Vec::new();
+            amnf.write_all(&[0; 3])?; // x offset
+            amnf.write_all(&[0; 3])?; // y offset
+            amnf.write_all(&(width - 1).to_le_bytes()[..3])?; // frame width
+            amnf.write_all(&(height - 1).to_le_bytes()[..3])?; // frame height
+            amnf.write_all(&[0; 3])?; // duration
+            amnf.push(0); // flags
+
+            write_chunk(&mut amnf, b"VP8L", &frame)?;
+            write_chunk(&mut self.writer, b"ANMF", &amnf)?;
+        }
+
+        if !self.exif_metadata.is_empty() {
+            write_chunk(&mut self.writer, b"EXIF", &self.exif_metadata)?;
+        }
+
+        if !self.xmp_metadata.is_empty() {
+            write_chunk(&mut self.writer, b"XMP ", &self.xmp_metadata)?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
