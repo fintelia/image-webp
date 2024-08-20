@@ -1,4 +1,7 @@
-use std::ops::Range;
+use std::{
+    ops::Range,
+    simd::u8x32,
+};
 
 use crate::decoder::DecodingError;
 
@@ -368,7 +371,20 @@ pub(crate) fn apply_color_transform(
 }
 
 pub(crate) fn apply_subtract_green_transform(image_data: &mut [u8]) {
-    for pixel in image_data.chunks_exact_mut(4) {
+    const MASK: u8x32 = u8x32::from_array([
+        0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0,
+        0, 0xff, 0, 0, 0, 0xff, 0, 0,
+    ]);
+
+    let mut chunks = image_data.chunks_exact_mut(32);
+    for chunk in &mut chunks {
+        let mut value = u8x32::from_slice(chunk);
+        let green = value & MASK;
+        value += green.rotate_elements_left::<1>() | green.rotate_elements_right::<1>();
+        value.copy_to_slice(chunk);
+    }
+
+    for pixel in chunks.into_remainder().chunks_exact_mut(4) {
         pixel[0] = pixel[0].wrapping_add(pixel[1]);
         pixel[2] = pixel[2].wrapping_add(pixel[1]);
     }

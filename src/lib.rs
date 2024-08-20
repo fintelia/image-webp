@@ -1,5 +1,5 @@
 //! Decoding and Encoding of WebP Images
-
+#![feature(portable_simd)]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 // Increase recursion limit for the `quick_error!` macro.
