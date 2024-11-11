@@ -387,17 +387,17 @@ impl<R: BufRead> LosslessDecoder<R> {
             let new_code_lengths =
                 self.read_huffman_code_lengths(code_length_code_lengths, alphabet_size)?;
 
-            HuffmanTree::build_implicit(new_code_lengths)
+            HuffmanTree::build_implicit(&new_code_lengths)
         }
     }
 
     /// Reads huffman code lengths
     fn read_huffman_code_lengths(
         &mut self,
-        code_length_code_lengths: Vec<u16>,
+        code_length_code_lengths: Vec<u8>,
         num_symbols: u16,
-    ) -> Result<Vec<u16>, DecodingError> {
-        let table = HuffmanTree::build_implicit(code_length_code_lengths)?;
+    ) -> Result<Vec<u8>, DecodingError> {
+        let table = HuffmanTree::build_implicit(&code_length_code_lengths)?;
 
         let mut max_symbol = if self.bit_reader.read_bits::<u8>(1)? == 1 {
             let length_nbits = 2 + 2 * self.bit_reader.read_bits::<u8>(3)?;
@@ -421,7 +421,7 @@ impl<R: BufRead> LosslessDecoder<R> {
             max_symbol -= 1;
 
             self.bit_reader.fill()?;
-            let code_len = table.read_symbol(&mut self.bit_reader)?;
+            let code_len = table.read_symbol(&mut self.bit_reader)? as u8;
 
             if code_len < 16 {
                 code_lengths[usize::from(symbol)] = code_len;

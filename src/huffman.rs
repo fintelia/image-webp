@@ -9,7 +9,9 @@ use super::lossless::BitReader;
 ///
 
 const MAX_ALLOWED_CODE_LENGTH: usize = 15;
-const MAX_TABLE_BITS: u8 = 10;
+const TABLE_BITS: u8 = 10;
+const TABLE_MASK: u16 = (1 << TABLE_BITS) - 1;
+const SECONDARY_TABLE_ENTRY: u32 = 1 << 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HuffmanTreeNode {
@@ -22,10 +24,23 @@ enum HuffmanTreeNode {
 enum HuffmanTreeInner {
     Single(u16),
     Tree {
-        tree: Vec<HuffmanTreeNode>,
-        table: Vec<u32>,
-        table_mask: u16,
+        primary_table: [u32; 1 << TABLE_BITS],
+        secondary_table: Vec<u16>,
     },
+}
+
+/// Return the next code, or if the codeword is already all ones (which is the final code), return
+/// the same code again.
+fn next_codeword(mut codeword: u16, table_size: u16) -> u16 {
+    if codeword == table_size - 1 {
+        return codeword;
+    }
+
+    let adv = (u16::BITS - 1) - (codeword ^ (table_size - 1)).leading_zeros();
+    let bit = 1 << adv;
+    codeword &= bit - 1;
+    codeword |= bit;
+    codeword
 }
 
 /// Huffman tree
@@ -40,113 +55,120 @@ impl Default for HuffmanTree {
 
 impl HuffmanTree {
     /// Builds a tree implicitly, just from code lengths
-    pub(crate) fn build_implicit(code_lengths: Vec<u16>) -> Result<HuffmanTree, DecodingError> {
+    pub(crate) fn build_implicit(code_lengths: &[u8]) -> Result<HuffmanTree, DecodingError> {
         // Count symbols and build histogram
-        let mut num_symbols = 0;
-        let mut code_length_hist = [0; MAX_ALLOWED_CODE_LENGTH + 1];
-        for &length in code_lengths.iter().filter(|&&x| x != 0) {
-            code_length_hist[usize::from(length)] += 1;
-            num_symbols += 1;
+        let mut histogram = [0; 16];
+        for &length in code_lengths {
+            histogram[length as usize] += 1;
         }
 
         // Handle special cases
-        if num_symbols == 0 {
+        if histogram[0] == code_lengths.len() {
             return Err(DecodingError::HuffmanError);
-        } else if num_symbols == 1 {
+        } else if histogram[0] == code_lengths.len() - 1 {
             let root_symbol = code_lengths.iter().position(|&x| x != 0).unwrap() as u16;
             return Ok(Self::build_single_node(root_symbol));
         };
 
-        // Assign codes
-        let mut curr_code = 0;
-        let mut next_codes = [0; MAX_ALLOWED_CODE_LENGTH + 1];
-        let max_code_length = code_length_hist.iter().rposition(|&x| x != 0).unwrap() as u16;
-        for code_len in 1..=usize::from(max_code_length) {
-            next_codes[code_len] = curr_code;
-            curr_code = (curr_code + code_length_hist[code_len]) << 1;
+        // Determine the maximum code length.
+        let mut max_length = 15;
+        while max_length > 1 && histogram[max_length] == 0 {
+            max_length -= 1;
         }
 
+        // Sort symbols by code length. Given the histogram, we can determine the starting offset
+        // for each code length.
+        let mut offsets = [0; 16];
+        let mut codespace_used = 0usize;
+        offsets[1] = histogram[0];
+        for i in 1..max_length {
+            offsets[i + 1] = offsets[i] + histogram[i];
+            codespace_used = (codespace_used << 1) + histogram[i];
+        }
+        codespace_used = (codespace_used << 1) + histogram[max_length];
+
         // Confirm that the huffman tree is valid
-        if curr_code != 2 << max_code_length {
+        if codespace_used != 1 << max_length {
             return Err(DecodingError::HuffmanError);
         }
 
-        // Calculate table/tree parameters
-        let table_bits = max_code_length.min(MAX_TABLE_BITS as u16);
-        let table_size = (1 << table_bits) as usize;
-        let table_mask = table_size as u16 - 1;
-        let tree_size = code_length_hist[table_bits as usize + 1..=max_code_length as usize]
-            .iter()
-            .sum::<u16>() as usize;
+        // Sort the symbols by code length.
+        let mut next_index = offsets;
+        let mut sorted_symbols = vec![0; code_lengths.len()];
+        for symbol in 0..code_lengths.len() {
+            let length = code_lengths[symbol];
+            sorted_symbols[next_index[length as usize]] = symbol;
+            next_index[length as usize] += 1;
+        }
 
-        // Populate decoding table
-        let mut tree = Vec::with_capacity(2 * tree_size);
-        let mut table = vec![0; table_size];
-        for (symbol, &length) in code_lengths.iter().enumerate() {
-            if length == 0 {
-                continue;
+        let mut codeword = 0u16;
+        let mut i = histogram[0];
+
+        // Populate the primary decoding table
+        let mut primary_table = [0u32; 1 << TABLE_BITS];
+        let primary_table_bits = primary_table.len().ilog2() as usize;
+        let primary_table_mask = (1 << primary_table_bits) - 1;
+        for length in 1..=primary_table_bits {
+            let current_table_end = 1 << length;
+
+            // Loop over all symbols with the current code length and set their table entries.
+            for _ in 0..histogram[length] {
+                let symbol = sorted_symbols[i];
+                i += 1;
+
+                primary_table[codeword as usize] = ((symbol as u32) << 16) | length as u32;
+                codeword = next_codeword(codeword, current_table_end as u16);
             }
 
-            let code = next_codes[length as usize];
-            next_codes[length as usize] += 1;
+            // If we aren't at the maximum table size, double the size of the table.
+            if length < primary_table_bits {
+                primary_table.copy_within(0..current_table_end, current_table_end);
+            }
+        }
 
-            if length <= table_bits {
-                let mut j = (u16::reverse_bits(code) >> (16 - length)) as usize;
-                let entry = ((length as u32) << 16) | symbol as u32;
-                while j < table_size {
-                    table[j] = entry;
-                    j += 1 << length as usize;
-                }
-            } else {
-                let table_index =
-                    ((u16::reverse_bits(code) >> (16 - length)) & table_mask) as usize;
-                let table_value = table[table_index];
-
-                debug_assert_eq!(table_value >> 16, 0);
-
-                let mut node_index = if table_value == 0 {
-                    let node_index = tree.len();
-                    table[table_index] = (node_index + 1) as u32;
-                    tree.push(HuffmanTreeNode::Empty);
-                    node_index
-                } else {
-                    (table_value - 1) as usize
-                };
-
-                let code = usize::from(code);
-                for depth in (0..length - table_bits).rev() {
-                    let node = tree[node_index];
-
-                    let offset = match node {
-                        HuffmanTreeNode::Empty => {
-                            // Turns a node from empty into a branch and assigns its children
-                            let offset = tree.len() - node_index;
-                            tree[node_index] = HuffmanTreeNode::Branch(offset);
-                            tree.push(HuffmanTreeNode::Empty);
-                            tree.push(HuffmanTreeNode::Empty);
-                            offset
-                        }
-                        HuffmanTreeNode::Leaf(_) => return Err(DecodingError::HuffmanError),
-                        HuffmanTreeNode::Branch(offset) => offset,
-                    };
-
-                    node_index += offset + ((code >> depth) & 1);
-                }
-
-                match tree[node_index] {
-                    HuffmanTreeNode::Empty => {
-                        tree[node_index] = HuffmanTreeNode::Leaf(symbol as u16)
+        // Populate the secondary decoding table.
+        let mut secondary_table = Vec::new();
+        if max_length > primary_table_bits {
+            let mut subtable_start = 0;
+            let mut subtable_prefix = !0;
+            for length in (primary_table_bits + 1)..=max_length {
+                let subtable_size = 1 << (length - primary_table_bits);
+                for _ in 0..histogram[length] {
+                    // If the codeword's prefix doesn't match the current subtable, create a new
+                    // subtable.
+                    if codeword & primary_table_mask != subtable_prefix {
+                        subtable_prefix = codeword & primary_table_mask;
+                        subtable_start = secondary_table.len();
+                        primary_table[subtable_prefix as usize] = ((subtable_start as u32) << 16)
+                            | SECONDARY_TABLE_ENTRY
+                            | (subtable_size as u32 - 1);
+                        secondary_table.resize(subtable_start + subtable_size, 0);
                     }
-                    HuffmanTreeNode::Leaf(_) => return Err(DecodingError::HuffmanError),
-                    HuffmanTreeNode::Branch(_offset) => return Err(DecodingError::HuffmanError),
+
+                    // Lookup the symbol.
+                    let symbol = sorted_symbols[i];
+                    i += 1;
+
+                    // Insert the symbol into the secondary table and advance to the next codeword.
+                    secondary_table[subtable_start + (codeword >> primary_table_bits) as usize] =
+                        ((symbol as u16) << 4) | (length as u16);
+                    codeword = next_codeword(codeword, 1 << length);
+                }
+
+                // If there are more codes with the same subtable prefix, extend the subtable.
+                if length < max_length && codeword & primary_table_mask == subtable_prefix {
+                    secondary_table.extend_from_within(subtable_start..);
+                    let subtable_size = secondary_table.len() - subtable_start;
+                    primary_table[subtable_prefix as usize] = ((subtable_start as u32) << 16)
+                        | SECONDARY_TABLE_ENTRY
+                        | (subtable_size as u32 - 1);
                 }
             }
         }
 
         Ok(Self(HuffmanTreeInner::Tree {
-            tree,
-            table,
-            table_mask,
+            primary_table,
+            secondary_table,
         }))
     }
 
@@ -155,44 +177,20 @@ impl HuffmanTree {
     }
 
     pub(crate) fn build_two_node(zero: u16, one: u16) -> HuffmanTree {
+        let mut primary_table = [0u32; 1 << TABLE_BITS];
+        for pair in primary_table.chunks_exact_mut(2) {
+            pair[0] = ((zero as u32) << 16) | 1;
+            pair[1] = ((one as u32) << 16) | 1;
+        }
+
         Self(HuffmanTreeInner::Tree {
-            tree: vec![
-                HuffmanTreeNode::Leaf(zero),
-                HuffmanTreeNode::Leaf(one),
-                HuffmanTreeNode::Empty,
-            ],
-            table: vec![1 << 16 | zero as u32, 1 << 16 | one as u32],
-            table_mask: 0x1,
+            primary_table,
+            secondary_table: Vec::new(),
         })
     }
 
     pub(crate) fn is_single_node(&self) -> bool {
         matches!(self.0, HuffmanTreeInner::Single(_))
-    }
-
-    #[inline(never)]
-    fn read_symbol_slowpath<R: BufRead>(
-        tree: &[HuffmanTreeNode],
-        mut v: usize,
-        start_index: usize,
-        bit_reader: &mut BitReader<R>,
-    ) -> Result<u16, DecodingError> {
-        let mut depth = MAX_TABLE_BITS;
-        let mut index = start_index;
-        loop {
-            match &tree[index] {
-                HuffmanTreeNode::Branch(children_offset) => {
-                    index += children_offset + (v & 1);
-                    depth += 1;
-                    v >>= 1;
-                }
-                HuffmanTreeNode::Leaf(symbol) => {
-                    bit_reader.consume(depth)?;
-                    return Ok(*symbol);
-                }
-                HuffmanTreeNode::Empty => return Err(DecodingError::HuffmanError),
-            }
-        }
     }
 
     /// Reads a symbol using the bit reader.
@@ -205,23 +203,22 @@ impl HuffmanTree {
     ) -> Result<u16, DecodingError> {
         match &self.0 {
             HuffmanTreeInner::Tree {
-                tree,
-                table,
-                table_mask,
+                primary_table,
+                secondary_table,
             } => {
                 let v = bit_reader.peek_full() as u16;
-                let entry = table[(v & table_mask) as usize];
-                if entry >> 16 != 0 {
-                    bit_reader.consume((entry >> 16) as u8)?;
-                    return Ok(entry as u16);
+                let entry = primary_table[(v & TABLE_MASK) as usize];
+                if entry & SECONDARY_TABLE_ENTRY == 0 {
+                    bit_reader.consume(entry as u8)?;
+                    return Ok((entry >> 16) as u16);
+                } else {
+                    let subtable_start = (entry >> 16) as usize;
+                    let subtable_mask = (entry & 0xff) as u16;
+                    let subtable_entry = secondary_table
+                        [subtable_start + ((v >> TABLE_BITS) & subtable_mask) as usize];
+                    bit_reader.consume((subtable_entry & 0xf) as u8)?;
+                    return Ok(subtable_entry >> 4);
                 }
-
-                Self::read_symbol_slowpath(
-                    tree,
-                    (v >> MAX_TABLE_BITS) as usize,
-                    ((entry & 0xffff) - 1) as usize,
-                    bit_reader,
-                )
             }
             HuffmanTreeInner::Single(symbol) => Ok(*symbol),
         }
@@ -237,12 +234,12 @@ impl HuffmanTree {
     ) -> Option<(u8, u16)> {
         match &self.0 {
             HuffmanTreeInner::Tree {
-                table, table_mask, ..
+                primary_table, ..
             } => {
                 let v = bit_reader.peek_full() as u16;
-                let entry = table[(v & table_mask) as usize];
-                if entry >> 16 != 0 {
-                    return Some(((entry >> 16) as u8, entry as u16));
+                let entry = primary_table[(v & TABLE_MASK) as usize];
+                if entry & SECONDARY_TABLE_ENTRY == 0 {
+                    return Some((entry as u8, (entry >> 16) as u16));
                 }
                 None
             }
